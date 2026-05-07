@@ -1,0 +1,6 @@
+{
+  "name": "Signal Pro - Deriv AI",
+  "description": "Professional trading signal platform powered by Deriv WebSocket and AI with a secure hacker-themed interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["Real-time Data", "Authentication", "Trading Signals"]
+}
