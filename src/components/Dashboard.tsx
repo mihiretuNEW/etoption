@@ -389,175 +389,46 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
     }
   };
 
-  // Background Scanner Implementation
+  // Background Signal Listener
   useEffect(() => {
-    if (!isScanningEnabled || activeTrade || isExpired || isLimitReached || pendingSignal) {
-      setScanStatus(!isScanningEnabled ? "Scanner Paused" : "Waiting for next cycle...");
-      return;
-    }
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    const socket = new WebSocket(`${protocol}//${host}/ws-signals`);
 
-    scanWs.current = new WebSocket(WS_URL);
-    let pairIndex = 0;
-    let scanInterval: any;
-
-    const startScan = () => {
-      setIsScanning(true);
-      scanInterval = setInterval(() => {
-        if (scanWs.current?.readyState === WebSocket.OPEN && !pendingSignal && !activeTrade && isScanningEnabled) {
-          const pair = PAIRS[pairIndex];
-          setScanStatus(`Deep Analysis: ${pair.name}...`);
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'NEW_SIGNAL' && isScanningEnabled && !isExpired && !isLimitReached) {
+        if (!pendingSignal && !activeTrade) {
+          const signal = data.signal;
+          setPendingSignal(signal);
           
-          scanWs.current.send(JSON.stringify({
-            ticks_history: pair.id,
-            adjust_start_time: 1,
-            count: 100, 
-            end: 'latest',
-            granularity: 120, // 2M timeframe
-            style: 'candles'
-          }));
+          // Find the pair object to update chart
+          const pairObj = PAIRS.find(p => p.id === signal.pairId) || PAIRS[0];
+          setSelectedPair(pairObj);
 
-          pairIndex = (pairIndex + 1) % PAIRS.length;
-        }
-      }, 5000); // Slightly slower to pick the BEST one
-    };
-
-    scanWs.current.onopen = startScan;
-
-    scanWs.current.onmessage = (msg) => {
-      const data = JSON.parse(msg.data);
-      if (data.candles && !pendingSignal && !activeTrade && isScanningEnabled) {
-        const pairId = data.echo_req.ticks_history;
-        const pair = PAIRS.find(p => p.id === pairId);
-        if (!pair) return;
-
-        const candles = data.candles;
-        const lastCandle = candles[candles.length - 1];
-        const prevCandle = candles[candles.length - 2];
-        const currentPrice = lastCandle.close;
-        
-        // --- RENKO DOUBLE-BRICK TREND CONFIRMATION STRATEGY ---
-        
-        // 1. Calculate ATR (14) for Dynamic Brick Size
-        let atr = 0;
-        if (candles.length > 14) {
-          const trueRanges = [];
-          for (let i = 1; i < candles.length; i++) {
-            const h = candles[i].high;
-            const l = candles[i].low;
-            const pc = candles[i-1].close;
-            trueRanges.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-          }
-          atr = trueRanges.slice(-14).reduce((a, b) => a + b, 0) / 14;
-        }
-        const brickSize = atr > 0 ? atr : currentPrice * 0.0003;
-
-        // 2. Build Renko Chain
-        const bricks: { type: 'up' | 'down'; open: number; close: number }[] = [];
-        let pClose = candles[0].close;
-        candles.forEach((c: any) => {
-          const diff = c.close - pClose;
-          if (Math.abs(diff) >= brickSize) {
-            const num = Math.floor(Math.abs(diff) / brickSize);
-            for (let j = 0; j < num; j++) {
-              bricks.push({ 
-                type: diff > 0 ? 'up' : 'down', 
-                open: pClose, 
-                close: pClose + (diff > 0 ? brickSize : -brickSize) 
-              });
-              pClose = bricks[bricks.length - 1].close;
-            }
-          }
-        });
-
-        // 3. Structural Level Mapping (Filter)
-        const levels: { price: number; type: 'sup' | 'res' }[] = [];
-        for (let i = 2; i < bricks.length - 3; i++) {
-          if (bricks[i-1].type !== bricks[i].type) {
-            levels.push({ 
-              price: bricks[i].open, 
-              type: bricks[i].type === 'up' ? 'sup' : 'res' 
-            });
-          }
-        }
-
-        // 4. Strategic Analysis (Double-Brick Rule)
-        let signalFound = false;
-        let type: 'RISE' | 'FALL' = 'RISE';
-        let reason = "";
-
-        if (bricks.length > 10) {
-          const lastIndex = bricks.length - 1;
-          const b1 = bricks[lastIndex];     // Current Brick (Signal)
-          const b2 = bricks[lastIndex - 1]; // Previous Brick (Alert)
-          const b3 = bricks[lastIndex - 2]; // Reversal Point
-          
-          // TREND ZONE (Last 10 bricks staircase check)
-          const contextBricks = bricks.slice(-10, -2);
-          const upCount = contextBricks.filter(b => b.type === 'up').length;
-          const downCount = contextBricks.filter(b => b.type === 'down').length;
-          
-          // Conditions for Trend Zone (at least 3 or 4 same-color bricks to prove momentum)
-          const isStaircaseDown = downCount >= 5; 
-          const isStaircaseUp = upCount >= 5;
-
-          // BUY SIGNAL: Red staircase -> 1st Green (Alert) -> 2nd Green (Signal)
-          if (b1.type === 'up' && b2.type === 'up' && b3.type === 'down' && isStaircaseDown) {
-            const nearSup = levels.find(l => l.type === 'sup' && Math.abs(currentPrice - l.price) < brickSize * 4);
-            if (nearSup) {
-              signalFound = true;
-              type = 'RISE';
-              reason = "Double-Brick Reversal @ Support Bounce (5m Exp)";
-            }
-          }
-          // SELL SIGNAL: Green staircase -> 1st Red (Alert) -> 2nd Red (Signal)
-          else if (b1.type === 'down' && b2.type === 'down' && b3.type === 'up' && isStaircaseUp) {
-            const nearRes = levels.find(l => l.type === 'res' && Math.abs(currentPrice - l.price) < brickSize * 4);
-            if (nearRes) {
-              signalFound = true;
-              type = 'FALL';
-              reason = "Double-Brick Reversal @ Resistance Reject (5m Exp)";
-            }
-          }
-        }
-
-        if (signalFound && !pendingSignal && !activeTrade && isScanningEnabled) {
+          // Telegram Logic (Matching your exact format)
           const now = Math.floor(Date.now() / 1000);
-          const entryOffset = 60; // Exactly 1 minute preparation
-          const duration = 300; // 5 minutes
-          
-          const newSignal: TradeSignal = {
-            id: Math.random().toString(36).substr(2, 9),
-            pair: pair,
-            pairId: pair.id,
-            pairName: pair.name,
-            type: type,
-            entryTime: now + entryOffset, 
-            expirationTime: now + entryOffset + duration, 
-            status: 'pending'
-          };
-          
-          // LOCK SCANNER IMMEDIATELY
-          setPendingSignal(newSignal);
-          setSelectedPair(pair);
-          
-          // TELEGRAM FORMAT MATCHING PHOTO
           const teleMsg = `
-✅ <b>Pair:</b> ${pair.name}
+✅ <b>Pair:</b> ${signal.pair}
 ✅ <b>Duration:</b> 5 Minutes
-✅ <b>Signal:</b> ${type === 'RISE' ? 'RISE 🟢' : 'FALL 🔴'}
-🔹 <b>Enter at:</b> ${formatEthTime(now + entryOffset)}
+✅ <b>Signal:</b> ${signal.type === 'RISE' ? 'RISE 🟢' : 'FALL 🔴'}
+🔹 <b>Enter at:</b> ${formatEthTime(signal.entryTime)}
 `;
           sendTelegramMessage(teleMsg);
-
-          console.log(`[SIGNAL LOCKED] ${pair.name} - ${type}`);
+          console.log(`[SERVER SIGNAL RECEIVED] ${signal.pair}`);
         }
       }
     };
 
-    return () => {
-      clearInterval(scanInterval);
-      scanWs.current?.close();
-    };
+    return () => socket.close();
+  }, [isScanningEnabled, isExpired, isLimitReached, pendingSignal, activeTrade]);
+
+  useEffect(() => {
+    if (!isScanningEnabled || activeTrade || isExpired || isLimitReached || pendingSignal) {
+      setScanStatus(!isScanningEnabled ? "Scanner Paused" : "Background Scanner Active...");
+      return;
+    }
+    setScanStatus("Background Scanner Active - Waiting for high probability signal...");
   }, [activeTrade, isExpired, isLimitReached, isScanningEnabled, pendingSignal]);
 
   // Handle Trade lifecycle
